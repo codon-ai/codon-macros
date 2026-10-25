@@ -1,10 +1,14 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
-import { simpleGit } from "simple-git";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import analyse, { buildDictionary, scanDirectory, type CandidateBuckets } from "./lib/subtree.js";
+import { buildDictionary, scanDirectory, analyseSource, type CandidateBuckets } from "./lib/subtree.js";
+import { streamParquet, type ParquetIngestOptions } from "./lib/parquet.js";
 import type { DictionaryOptions } from "./types.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // Parse CLI arguments
 const args = process.argv.slice(2);
@@ -13,83 +17,91 @@ function getArg(flag: string, fallback: string = ""): string {
     return idx !== -1 && idx + 1 < args.length ? (args[idx + 1] ?? fallback) : fallback;
 }
 
+function findDataDir(): string {
+    const candidates = [
+        getArg("--data"),
+        "./data",
+        "./codon-macros/data",
+        "../data",
+        resolve(__dirname, "../data"),
+        resolve(__dirname, "./data"),
+    ].filter(Boolean) as string[];
+
+    for (const c of candidates) {
+        if (existsSync(c)) return resolve(c);
+    }
+    return resolve("./data");
+}
+
 const customDir = getArg("--dir");
-const reposFile = getArg("--repos", "./data.json");
-const minNodes = parseInt(getArg("--min-nodes", "15"), 10);
-const minOccurrences = parseInt(getArg("--min-occurrences", "2"), 10);
-const minRepos = parseInt(getArg("--min-repos", "1"), 10);
+const dataDir = findDataDir();
+const minStars = parseInt(getArg("--min-stars", "10"), 10);
+const maxFiles = parseInt(getArg("--max-files", "15000"), 10);
+const minNodes = parseInt(getArg("--min-nodes", "12"), 10);
+const minOccurrences = parseInt(getArg("--min-occurrences", "3"), 10);
+const minRepos = parseInt(getArg("--min-repos", "2"), 10);
 const minFiles = parseInt(getArg("--min-files", "2"), 10);
 const maxParams = parseInt(getArg("--max-params", "6"), 10);
 const outFile = getArg("--out", "./dict.json");
 
-const ROOT = "./temp";
 const buckets: CandidateBuckets = new Map();
 
-console.log("=== Codon Macro Subtree Extraction ===");
+console.log("=================================================");
+console.log("   Codon Macro Extraction (Parquet Ingestion)   ");
+console.log("=================================================");
 console.log(`Config: minNodes=${minNodes}, minOccurrences=${minOccurrences}, minRepos=${minRepos}, minFiles=${minFiles}, maxParams=${maxParams}`);
+
+const t0 = performance.now();
+let totalIngested = 0;
 
 if (customDir) {
     const targetDir = resolve(customDir);
     console.log(`Scanning local directory: ${targetDir}`);
-    const count = await scanDirectory(targetDir, buckets, basename(targetDir), { minNodes });
-    console.log(`Scanned ${count} files.`);
-} else if (existsSync(reposFile)) {
-    await mkdir(ROOT, { recursive: true });
-    let data: string[] = [];
-    try {
-        data = JSON.parse(await Bun.file(reposFile).text());
-    } catch (e) {
-        console.error(`Failed to parse ${reposFile}:`, e);
-    }
+    totalIngested = await scanDirectory(targetDir, buckets, basename(targetDir), { minNodes });
+    console.log(`Scanned ${totalIngested} files.`);
+} else if (existsSync(dataDir)) {
+    console.log(`Ingesting from Parquet directory: ${dataDir}`);
+    console.log(`Filtering: minStars=${minStars}, maxFiles=${maxFiles}`);
 
-    if (Array.isArray(data) && data.length > 0) {
-        console.log(`Processing ${data.length} repositories from ${reposFile}...`);
-        const git = simpleGit(ROOT);
-        for (const repository of data) {
-            const name = basename(repository.replace(/\/$/, "")).replace(/\.git$/, "");
-            const destination = join(ROOT, name);
-            try {
-                if ((await stat(destination)).isDirectory()) {
-                    console.log(`[repo] ${repository} already cached.`);
-                    continue;
-                }
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-            }
-            try {
-                console.log(`[clone] ${repository} -> ${name}`);
-                await git.clone(repository, name);
-            } catch (error) {
-                console.error(`Could not clone ${repository}:`, error);
-            }
+    const parquetOpts: ParquetIngestOptions = {
+        dataDir,
+        minStars,
+        maxFiles,
+        maxLineLength: 400,
+        minChars: 60,
+        maxChars: 35000,
+    };
+
+    let parseErrors = 0;
+    let lastReport = 0;
+
+    totalIngested = await streamParquet(parquetOpts, (record) => {
+        try {
+            analyseSource(record.content, record.path, record.repo, buckets, { minNodes });
+        } catch {
+            parseErrors++;
         }
-    }
 
-    const entries = await readdir(ROOT, { withFileTypes: true });
-    for (const entry of entries) {
-        if (!entry.isDirectory() || entry.name === "files") continue;
-        console.log(`Analyzing repository: ${entry.name}...`);
-        await analyse(entry, buckets, minNodes);
-    }
-} else if (existsSync(ROOT)) {
-    console.log(`Scanning cached repositories in ${ROOT}...`);
-    const entries = await readdir(ROOT, { withFileTypes: true });
-    for (const entry of entries) {
-        if (!entry.isDirectory() || entry.name === "files") continue;
-        console.log(`Analyzing repository: ${entry.name}...`);
-        await analyse(entry, buckets, minNodes);
-    }
+        const count = totalIngested;
+        if (count - lastReport >= 2000) {
+            console.log(`... ingested ${count} files (buckets: ${buckets.size})`);
+            lastReport = count;
+        }
+    });
+
+    console.log(`Ingested and analyzed ${totalIngested} code files (${parseErrors} parse skips).`);
 } else {
-    console.log("No --dir provided and no data.json or temp folder found.");
-    console.log("Usage examples:");
-    console.log("  bun run index.ts --dir /path/to/repos");
-    console.log("  bun run index.ts --repos repos.json --min-repos 2 --out dict.json");
-    process.exit(0);
+    console.error(`Error: Could not locate parquet dataset at ${dataDir}`);
+    console.error("Please supply --data <path-to-parquets> or --dir <path-to-js-dir>");
+    process.exit(1);
 }
 
-console.log(`\nCandidate buckets collected: ${buckets.size}`);
+const t1 = performance.now();
+console.log(`AST subtree collection completed in ${((t1 - t0) / 1000).toFixed(2)}s.`);
+console.log(`Unique structural buckets collected: ${buckets.size}\n`);
 
 // Stage 2: build filtered, scored, deduplicated dictionary
+console.log("Building canonical macro dictionary...");
 const options: DictionaryOptions = {
     minOccurrences,
     minRepos,
@@ -103,9 +115,23 @@ const options: DictionaryOptions = {
 const masterDict = buildDictionary(buckets, options);
 const outPath = resolve(outFile);
 await writeFile(outPath, JSON.stringify(masterDict, null, 2));
-console.log(`Saved ${Object.keys(masterDict).length} macros to ${outPath}\n`);
+console.log(`✅ Saved ${Object.keys(masterDict).length} macros to ${outPath}`);
 
-console.log("=== Top Macro Idioms (Ranked by Compression Score) ===");
+// If codon directory exists, sync dict.json directly to codon repo
+const codonDictPath = resolve(__dirname, "../../codon/dict.json");
+const codonAltPath = resolve(__dirname, "../codon/dict.json");
+const targetCodonPath = existsSync(dirname(codonDictPath)) ? codonDictPath : (existsSync(dirname(codonAltPath)) ? codonAltPath : null);
+
+if (targetCodonPath) {
+    try {
+        await copyFile(outPath, targetCodonPath);
+        console.log(`✅ Synced macro dictionary to ${targetCodonPath}`);
+    } catch {
+        // Silently continue
+    }
+}
+
+console.log("\n=== Top Macro Idioms (Ranked by Compression Score) ===");
 const stars = Object.entries(masterDict)
     .sort(([, a], [, b]) => b.score - a.score)
     .slice(0, 15);
