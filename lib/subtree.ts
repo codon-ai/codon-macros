@@ -1,10 +1,12 @@
 import type { Dirent } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 import * as acorn from "acorn";
 import jsxPlugin from "acorn-jsx";
 import { tsPlugin } from "@sveltejs/acorn-typescript";
 
-import type { Dictionary, Subtree, Parameter, Local, Occurrence } from "../types.js";
+import type { Dictionary, Subtree, Parameter, Local, Occurrence, DictionaryOptions } from "../types.js";
 
 const parser = acorn.Parser.extend(tsPlugin(), jsxPlugin());
 
@@ -32,6 +34,49 @@ interface Resolution {
     declarations: WeakMap<Node, Binding>;
 }
 
+/** Standalone AST node types that make syntactically coherent macros. */
+export const ALLOWED_MACRO_TYPES = new Set<string>([
+    // Complete Statements
+    "BlockStatement",
+    "IfStatement",
+    "TryStatement",
+    "ForStatement",
+    "ForOfStatement",
+    "ForInStatement",
+    "WhileStatement",
+    "DoWhileStatement",
+    "SwitchStatement",
+    "ReturnStatement",
+    "ExpressionStatement",
+    "VariableDeclaration",
+    "FunctionDeclaration",
+    "ClassDeclaration",
+
+    // Complete Expressions
+    "CallExpression",
+    "NewExpression",
+    "ArrowFunctionExpression",
+    "FunctionExpression",
+    "ConditionalExpression",
+    "BinaryExpression",
+    "LogicalExpression",
+    "ObjectExpression",
+    "ArrayExpression",
+    "MemberExpression",
+    "TaggedTemplateExpression",
+
+    // JSX Elements (complete element with tags and children)
+    "JSXElement",
+]);
+
+/** Standard constant literals that should remain fixed rather than parameter slots. */
+export const FIXED_COMMON_VALUES = new Set<unknown>([
+    0, 1, -1, 2, "", "use strict", "utf-8", "UTF-8",
+    true, false, null, undefined,
+    "GET", "POST", "PUT", "DELETE", "PATCH",
+    "application/json", "text/plain", "text/html",
+]);
+
 function isNode(value: unknown): value is Node {
     return value !== null && typeof value === "object" &&
         typeof (value as Node).type === "string";
@@ -43,7 +88,7 @@ function forEachChild(node: Node, visit: (child: Node, key: string) => void): vo
         if (isNode(value)) {
             visit(value, key);
         } else if (Array.isArray(value)) {
-            for (const child of value) {
+            for (const child of (value as unknown[])) {
                 if (isNode(child)) visit(child, key);
             }
         }
@@ -69,13 +114,6 @@ function lookup(scope: Scope, name: string, namespace: "value" | "type"): Bindin
     return undefined;
 }
 
-/**
- * Build a binding table before hashing anything. Declaring first and resolving
- * later handles references appearing before a declaration (including var hoisting).
- *
- * This handles common JS/TS lexical forms without needing a second parser or a
- * scope-analysis dependency. Unknown/exotic syntax is left name-sensitive.
- */
 function resolveScopes(program: Node): Resolution {
     const scopeOf = new WeakMap<Node, Scope>();
     const declarations = new WeakMap<Node, Binding>();
@@ -113,12 +151,12 @@ function resolveScopes(program: Node): Resolution {
                 declarePattern(data.argument as Node, scope);
                 return;
             case "ArrayPattern":
-                for (const item of (data.elements as (Node | null)[] ?? [])) {
+                for (const item of ((data.elements as (Node | null)[] | undefined) ?? [])) {
                     declarePattern(item, scope);
                 }
                 return;
             case "ObjectPattern":
-                for (const prop of (data.properties as Node[] ?? [])) {
+                for (const prop of ((data.properties as Node[] | undefined) ?? [])) {
                     const property = prop as AstRecord;
                     declarePattern(
                         (prop.type === "RestElement" ? property.argument : property.value) as Node,
@@ -143,21 +181,18 @@ function resolveScopes(program: Node): Resolution {
         }
 
         const fnScope = createScope(parent, true);
-        // Named function expressions bind their names only inside the function.
         if (node.type === "FunctionExpression") {
             declare(data.id as Node | null, fnScope);
         }
         if (isNode(data.id)) visit(data.id, fnScope);
 
         if (isNode(data.typeParameters)) visit(data.typeParameters, fnScope);
-        for (const param of (data.params as Node[] ?? [])) {
+        for (const param of ((data.params as Node[] | undefined) ?? [])) {
             declarePattern(param, fnScope);
         }
-        for (const param of (data.params as Node[] ?? [])) visit(param, fnScope);
+        for (const param of ((data.params as Node[] | undefined) ?? [])) visit(param, fnScope);
         if (isNode(data.returnType)) visit(data.returnType, fnScope);
 
-        // Function bodies share their function's var scope, rather than
-        // introducing another block for the parameters.
         const body = data.body;
         if (isNode(body)) {
             if (body.type === "BlockStatement") {
@@ -180,10 +215,9 @@ function resolveScopes(program: Node): Resolution {
             case "BlockStatement":
             case "SwitchStatement": {
                 const blockScope = createScope(scope);
-                // The discriminant runs in the enclosing scope.
                 if (node.type === "SwitchStatement" && isNode(data.discriminant)) {
                     visit(data.discriminant, scope);
-                    for (const branch of (data.cases as Node[] ?? [])) visit(branch, blockScope);
+                    for (const branch of ((data.cases as Node[] | undefined) ?? [])) visit(branch, blockScope);
                 } else {
                     visitChildren(node, blockScope);
                 }
@@ -192,7 +226,6 @@ function resolveScopes(program: Node): Resolution {
             case "ForStatement":
             case "ForInStatement":
             case "ForOfStatement": {
-                // let/const loop bindings belong to their own lexical scope.
                 const loopScope = createScope(scope);
                 visitChildren(node, loopScope);
                 return;
@@ -210,7 +243,7 @@ function resolveScopes(program: Node): Resolution {
             }
             case "VariableDeclaration": {
                 const target = data.kind === "var" ? scope.varScope : scope;
-                for (const decl of (data.declarations as Node[] ?? [])) {
+                for (const decl of ((data.declarations as Node[] | undefined) ?? [])) {
                     declarePattern((decl as AstRecord).id as Node, target);
                 }
                 visitChildren(node, scope);
@@ -237,15 +270,14 @@ function resolveScopes(program: Node): Resolution {
                 if (isNode(data.superTypeParameters)) visit(data.superTypeParameters, classScope);
                 if (isNode(data.implements)) visit(data.implements, classScope);
                 if (Array.isArray(data.implements)) {
-                    for (const impl of data.implements) if (isNode(impl)) visit(impl, classScope);
+                    for (const impl of (data.implements as unknown[])) if (isNode(impl)) visit(impl, classScope);
                 }
                 if (isNode(data.body)) visit(data.body, classScope);
                 return;
             }
             case "ImportDeclaration":
-                for (const spec of (data.specifiers as Node[] ?? [])) {
+                for (const spec of ((data.specifiers as Node[] | undefined) ?? [])) {
                     const local = (spec as AstRecord).local as Node | undefined;
-                    // Imported values may also name TS types.
                     declare(local, scope, "both");
                 }
                 visitChildren(node, scope);
@@ -270,7 +302,7 @@ function resolveScopes(program: Node): Resolution {
                 return;
             }
             case "TSTypeParameterDeclaration":
-                for (const param of (data.params as Node[] ?? [])) {
+                for (const param of ((data.params as Node[] | undefined) ?? [])) {
                     const name = (param as AstRecord).name;
                     if (isNode(name)) declare(name, scope, "type");
                 }
@@ -294,7 +326,6 @@ function resolveScopes(program: Node): Resolution {
     return { scopeOf, declarations };
 }
 
-/** Identifiers in these positions are names of properties, labels, etc., not references. */
 function fixedIdentifier(parent: Node | undefined, field: string | undefined): boolean {
     if (!parent) return false;
     const data = parent as AstRecord;
@@ -317,7 +348,6 @@ function fixedIdentifier(parent: Node | undefined, field: string | undefined): b
     return false;
 }
 
-/** Only structurally meaningful scalar fields are included in fingerprints. */
 const SCALAR_FIELDS = new Set([
     "name", "value", "operator", "kind", "computed", "optional", "prefix",
     "async", "generator", "static", "method", "shorthand", "delegate",
@@ -345,8 +375,12 @@ function literalKind(value: unknown): string {
     return typeof value;
 }
 
-/** These literals cannot safely be replaced with a macro parameter identifier. */
-function fixedLiteral(parent?: Node, field?: string): boolean {
+function fixedLiteral(
+    parent?: Node,
+    field?: string,
+    value?: unknown,
+    keepCommonLiterals = true
+): boolean {
     if (!parent) return false;
     const record = parent as AstRecord;
     if (field === "key" && !record.computed) return true;
@@ -355,6 +389,7 @@ function fixedLiteral(parent?: Node, field?: string): boolean {
     if (parent.type === "TSLiteralType") return true;
     if (parent.type === "JSXAttribute" && field === "value") return true;
     if (parent.type === "ExpressionStatement" && record.directive) return true;
+    if (keepCommonLiterals && FIXED_COMMON_VALUES.has(value)) return true;
     return false;
 }
 
@@ -362,10 +397,6 @@ function fixedName(node: Node, parent?: Node, field?: string): boolean {
     return node.type !== "Identifier" || fixedIdentifier(parent, field);
 }
 
-/**
- * Encodes named AST fields in a deterministic order. The child callback returns
- * a hash in stage 1, or a canonicalized child representation in stage 2.
- */
 function encodeFields(node: Node, child: (node: Node, key: string) => unknown): unknown {
     const fields: [string, unknown][] = [];
     for (const [key, value] of Object.entries(node).sort(([a], [b]) => a.localeCompare(b))) {
@@ -374,8 +405,7 @@ function encodeFields(node: Node, child: (node: Node, key: string) => unknown): 
         if (isNode(value)) {
             fields.push([key, child(value, key)]);
         } else if (Array.isArray(value)) {
-            // Preserve order, holes, empty lists, and null slots.
-            fields.push([key, value.map(item => isNode(item) ? child(item, key) : scalar(item))]);
+            fields.push([key, (value as unknown[]).map(item => isNode(item) ? child(item, key) : scalar(item))]);
         } else if (SCALAR_FIELDS.has(key)) {
             fields.push([key, scalar(value)]);
         }
@@ -393,7 +423,6 @@ interface Candidate {
     depth: number;
 }
 
-/** Transient candidates used to defer expensive canonicalization. */
 export type CandidateBuckets = Map<string, Candidate[]>;
 
 const declarationsByBinding = new WeakMap<Resolution, Map<Binding, Node[]>>();
@@ -435,8 +464,11 @@ interface Normalized {
     templateSafe: boolean;
 }
 
-/** Normalize only likely clones; also retain enough data for macro extraction. */
-function normalizeCandidate(candidate: Candidate): Normalized {
+function normalizeCandidate(
+    candidate: Candidate,
+    maxParameters = 6,
+    keepCommonLiterals = true
+): Normalized {
     const { node: root, source, resolution } = candidate;
     const nameByBinding = new Map<Binding, string>();
     const declarations = declarationsByBinding.get(resolution) ?? new Map<Binding, Node[]>();
@@ -452,7 +484,6 @@ function normalizeCandidate(candidate: Candidate): Normalized {
 
     function recordEdit(node: Node, replacement: string, parent?: Node, field?: string): void {
         let text = replacement;
-        // Object shorthand {x} must become {x: __clone_arg0}, preserving key x.
         if (parent?.type === "Property" && field === "value" &&
             (parent as AstRecord).shorthand && node.type === "Identifier") {
             const key = (parent as AstRecord).key as Node;
@@ -482,7 +513,6 @@ function normalizeCandidate(candidate: Candidate): Normalized {
         const binding = resolution.declarations.get(node) ??
             (scope ? lookup(scope, name, namespace) : undefined);
 
-        // Unknown globals/API names must not accidentally become macro parameters.
         if (!binding) return `fixed:${name}`;
 
         let placeholder = nameByBinding.get(binding);
@@ -511,7 +541,7 @@ function normalizeCandidate(candidate: Candidate): Normalized {
         if (node.type === "Literal") {
             const value = (node as acorn.Literal).value;
             const kind = literalKind(value);
-            if (fixedLiteral(parent, field)) {
+            if (fixedLiteral(parent, field, value, keepCommonLiterals)) {
                 return ["Literal", kind, "fixed", scalar(value)];
             }
             const placeholder = `__clone_lit${literalCount++}`;
@@ -528,7 +558,6 @@ function normalizeCandidate(candidate: Candidate): Normalized {
     let template = "";
     let cursor = root.start;
     for (const edit of ordered) {
-        // Overlapping ranges can arise in unusual TS/JSX syntax. Fail closed.
         if (edit.start < cursor || edit.end > root.end) {
             templateSafe = false;
             continue;
@@ -537,15 +566,25 @@ function normalizeCandidate(candidate: Candidate): Normalized {
         cursor = edit.end;
     }
     template += source.slice(cursor, root.end);
-    // Mark these as needing manual handling instead of silently generating bad code.
     if (!templateSafe) template = source.slice(root.start, root.end);
+
+    // If candidate has too many parameters, mark templateSafe false to avoid parameter blowout
+    if (parameters.length > maxParameters) {
+        templateSafe = false;
+    }
+
     return { canonical, template, parameters, locals, arguments: args, bindings, templateSafe };
 }
 
-/** Cheap bottom-up fingerprint, including field names and normalized literal types. */
 function collectCandidate(
-    node: Node, buckets: CandidateBuckets, context: Omit<Candidate, "node" | "size" | "depth">,
-    minNodes: number, parent?: Node, field?: string
+    node: Node,
+    buckets: CandidateBuckets,
+    context: Omit<Candidate, "node" | "size" | "depth">,
+    minNodes: number,
+    allowedTypes: Set<string>,
+    parent?: Node,
+    field?: string,
+    keepCommonLiterals = true
 ): { hash: string; size: number; depth: number } {
     let size = 1;
     let depth = 1;
@@ -556,11 +595,11 @@ function collectCandidate(
         }
         if (node.type === "Literal") {
             const value = (node as acorn.Literal).value;
-            return ["Literal", literalKind(value), fixedLiteral(parent, field)
+            return ["Literal", literalKind(value), fixedLiteral(parent, field, value, keepCommonLiterals)
                 ? scalar(value) : "parameter"];
         }
         return encodeFields(node, (child, key) => {
-            const result = collectCandidate(child, buckets, context, minNodes, node, key);
+            const result = collectCandidate(child, buckets, context, minNodes, allowedTypes, node, key, keepCommonLiterals);
             size += result.size;
             depth = Math.max(depth, result.depth + 1);
             return result.hash;
@@ -568,7 +607,8 @@ function collectCandidate(
     })();
 
     const hash = Bun.hash(JSON.stringify(signature)).toString();
-    if (size >= minNodes) {
+    // Only register candidates that meet minNodes AND belong to coherent macro types!
+    if (size >= minNodes && allowedTypes.has(node.type)) {
         const candidates = buckets.get(hash) ?? [];
         candidates.push({ ...context, node, size, depth });
         buckets.set(hash, candidates);
@@ -576,15 +616,71 @@ function collectCandidate(
     return { hash, size, depth };
 }
 
-/** Stage 2: produce JSON-safe, canonical clone groups with macro data. */
-export function buildDictionary(buckets: CandidateBuckets, minOccurrences = 2): Dictionary {
-    const dictionary: Dictionary = Object.create(null) as Dictionary;
+export function classifyNodeType(nodeType: string): "statement" | "expression" | "declaration" {
+    if (nodeType.endsWith("Declaration")) return "declaration";
+    if (nodeType.endsWith("Statement") || nodeType === "CatchClause") return "statement";
+    return "expression";
+}
+
+export function generateMnemonicName(nodeType: string, index: number): string {
+    const typePrefix = nodeType
+        .replace(/([A-Z])/g, "_$1")
+        .toLowerCase()
+        .replace(/^_/, "")
+        .replace(/_statement$/, "_stmt")
+        .replace(/_expression$/, "_expr")
+        .replace(/_declaration$/, "_decl");
+    return `m_${typePrefix}_${index + 1}`;
+}
+
+/** Check if subtree B is subsumed by an already selected larger subtree A */
+function isSubsumed(
+    candidate: Subtree,
+    selected: Subtree[]
+): boolean {
+    for (const parent of selected) {
+        if (parent.size <= candidate.size) continue;
+        let containedCount = 0;
+        for (const cOcc of candidate.occurrences) {
+            const isContained = parent.occurrences.some(pOcc =>
+                pOcc.repository === cOcc.repository &&
+                pOcc.file === cOcc.file &&
+                pOcc.start <= cOcc.start &&
+                pOcc.end >= cOcc.end
+            );
+            if (isContained) containedCount++;
+        }
+        // If more than 75% of candidate occurrences are contained inside the parent
+        // and candidate does not have significantly higher independent frequency
+        if (containedCount >= candidate.count * 0.75 && candidate.count <= parent.count * 1.5) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Stage 2: produce JSON-safe, canonical clone groups with macro data and compression scoring. */
+export function buildDictionary(
+    buckets: CandidateBuckets,
+    options: DictionaryOptions | number = 2
+): Dictionary {
+    const opts: DictionaryOptions = typeof options === "number" ? { minOccurrences: options } : options;
+    const minOccurrences = opts.minOccurrences ?? 2;
+    const minRepos = opts.minRepos ?? 1;
+    const minFiles = opts.minFiles ?? 1;
+    const maxParameters = opts.maxParameters ?? 6;
+    const keepCommonLiterals = opts.keepCommonLiterals ?? true;
+    const filterSubsumed = opts.filterSubsumed ?? true;
+
+    const rawList: Subtree[] = [];
 
     for (const candidates of buckets.values()) {
         if (candidates.length < minOccurrences) continue;
         const exactGroups = new Map<string, { candidate: Candidate; normalized: Normalized }[]>();
         for (const candidate of candidates) {
-            const normalized = normalizeCandidate(candidate);
+            const normalized = normalizeCandidate(candidate, maxParameters, keepCommonLiterals);
+            // Skip non-template-safe entries (e.g. parameter overflow or overlapping text edits)
+            if (!normalized.templateSafe) continue;
             const group = exactGroups.get(normalized.canonical) ?? [];
             group.push({ candidate, normalized });
             exactGroups.set(normalized.canonical, group);
@@ -593,13 +689,14 @@ export function buildDictionary(buckets: CandidateBuckets, minOccurrences = 2): 
         for (const [canonical, matches] of exactGroups) {
             if (matches.length < minOccurrences) continue;
             const { candidate, normalized } = matches[0]!;
-            let hash = Bun.hash(canonical).toString();
-            // Defend against collisions in Bun.hash, even between structural groups.
-            if (dictionary[hash]?.canonical !== undefined && dictionary[hash]?.canonical !== canonical) {
-                let suffix = 1;
-                while (dictionary[`${hash}:${suffix}`]) suffix++;
-                hash = `${hash}:${suffix}`;
-            }
+
+            const distinctRepos = new Set(matches.map(m => m.candidate.repository));
+            const distinctFiles = new Set(matches.map(m => `${m.candidate.repository}:${m.candidate.file}`));
+
+            if (distinctRepos.size < minRepos) continue;
+            if (distinctFiles.size < minFiles) continue;
+            if (normalized.parameters.length > maxParameters) continue;
+
             const occurrences: Occurrence[] = matches.map(({ candidate: item, normalized: norm }) => ({
                 repository: item.repository,
                 file: item.file,
@@ -608,39 +705,148 @@ export function buildDictionary(buckets: CandidateBuckets, minOccurrences = 2): 
                 arguments: norm.arguments,
                 bindings: norm.bindings,
             }));
+
+            // Net Token Economy Model:
+            // ~1.5 tokens saved per AST node vs ~2 base tokens + 1.5 tokens per parameter for macro invocation
+            const tokenSavingsPerOccurrence = Math.max(0, (candidate.size * 1.5) - (2 + normalized.parameters.length * 1.5));
+            const rawSavings = tokenSavingsPerOccurrence * occurrences.length;
+            const diversityMultiplier = Math.sqrt(distinctRepos.size);
+            const score = Math.round(rawSavings * diversityMultiplier);
+
+            let hash = Bun.hash(canonical).toString();
             const subtree: Subtree = {
-                hash, canonical, nodeType: candidate.node.type,
-                depth: candidate.depth, size: candidate.size,
+                hash,
+                canonical,
+                nodeType: candidate.node.type,
+                category: classifyNodeType(candidate.node.type),
+                depth: candidate.depth,
+                size: candidate.size,
                 count: occurrences.length,
-                template: normalized.templateSafe ? normalized.template : "",
-                templateReady: matches.every(match => match.normalized.templateSafe),
+                distinctRepos: distinctRepos.size,
+                distinctFiles: distinctFiles.size,
+                score,
+                template: normalized.template,
+                templateReady: true,
                 parameters: normalized.parameters,
                 locals: normalized.locals,
                 occurrences,
             };
-            dictionary[hash] = subtree;
+            rawList.push(subtree);
         }
     }
+
+    // Sort by score descending
+    rawList.sort((a, b) => b.score - a.score || b.size - a.size);
+
+    // Apply subsumption filtering
+    const selected: Subtree[] = [];
+    for (const item of rawList) {
+        if (filterSubsumed && isSubsumed(item, selected)) {
+            continue;
+        }
+        selected.push(item);
+    }
+
+    // Assign mnemonic names and populate output dictionary
+    const dictionary: Dictionary = Object.create(null) as Dictionary;
+    selected.forEach((subtree, index) => {
+        subtree.name = generateMnemonicName(subtree.nodeType, index);
+        let finalHash = subtree.hash;
+        if (dictionary[finalHash] && dictionary[finalHash]?.canonical !== subtree.canonical) {
+            let suffix = 1;
+            while (dictionary[`${finalHash}:${suffix}`]) suffix++;
+            finalHash = `${finalHash}:${suffix}`;
+            subtree.hash = finalHash;
+        }
+        dictionary[finalHash] = subtree;
+    });
+
     return dictionary;
 }
 
-/** Useful for tests and for scanning one in-memory source file. */
+/** Analyze one in-memory source file. */
 export function analyseSource(
-    source: string, file: string, repository: string,
-    buckets: CandidateBuckets, minNodes = 15
+    source: string,
+    file: string,
+    repository: string,
+    buckets: CandidateBuckets,
+    options: DictionaryOptions | number = 15
 ): void {
-    const ast = parser.parse(source, {
-        ecmaVersion: "latest", sourceType: "module", locations: true,
-    }) as acorn.Program;
-    const resolution = resolveScopes(ast);
-    collectDeclarationNodes(ast, resolution);
-    for (const node of ast.body) {
-        collectCandidate(node, buckets, { resolution, source, file, repository }, minNodes);
+    const opts: DictionaryOptions = typeof options === "number" ? { minNodes: options } : options;
+    const minNodes = opts.minNodes ?? 15;
+    const allowedTypes = opts.allowedNodeTypes ?? ALLOWED_MACRO_TYPES;
+    const keepCommonLiterals = opts.keepCommonLiterals ?? true;
+
+    try {
+        const ast = parser.parse(source, {
+            ecmaVersion: "latest",
+            sourceType: "module",
+            locations: true,
+        }) as acorn.Program;
+        const resolution = resolveScopes(ast);
+        collectDeclarationNodes(ast, resolution);
+        for (const node of ast.body) {
+            collectCandidate(
+                node,
+                buckets,
+                { resolution, source, file, repository },
+                minNodes,
+                allowedTypes,
+                undefined,
+                undefined,
+                keepCommonLiterals
+            );
+        }
+    } catch {
+        // Silently skip unparseable files
     }
 }
 
+/** Recursively scan an arbitrary directory for JS/TS/JSX/TSX files. */
+export async function scanDirectory(
+    dirPath: string,
+    buckets: CandidateBuckets,
+    repositoryName: string = basename(dirPath),
+    options: DictionaryOptions | number = 15
+): Promise<number> {
+    const opts: DictionaryOptions = typeof options === "number" ? { minNodes: options } : options;
+    let scannedFiles = 0;
+
+    async function walk(currentDir: string): Promise<void> {
+        let entries: Dirent[];
+        try {
+            entries = await readdir(currentDir, { withFileTypes: true });
+        } catch {
+            return;
+        }
+
+        for (const entry of entries) {
+            if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist") {
+                continue;
+            }
+            const fullPath = join(currentDir, entry.name);
+            if (entry.isDirectory()) {
+                await walk(fullPath);
+            } else if (/\.(js|jsx|ts|tsx|mjs|cjs)$/.test(entry.name) && !entry.name.endsWith(".d.ts")) {
+                try {
+                    const source = await Bun.file(fullPath).text();
+                    analyseSource(source, fullPath, repositoryName, buckets, opts);
+                    scannedFiles++;
+                } catch {
+                    // Ignore unreadable files
+                }
+            }
+        }
+    }
+
+    await walk(dirPath);
+    return scannedFiles;
+}
+
 export default async function analyse(
-    directory: Dirent, buckets: CandidateBuckets, minNodes = 15
+    directory: Dirent,
+    buckets: CandidateBuckets,
+    minNodes = 15
 ): Promise<void> {
     const fileSieve = new Bun.Glob(`temp/${directory.name}/**/*.{js,ts,jsx,tsx}`);
     for await (const file of fileSieve.scan(".")) {

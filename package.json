@@ -11,5 +11,11 @@
   },
   "peerDependencies": {
     "typescript": "^7"
+  },
+  "dependencies": {
+    "@sveltejs/acorn-typescript": "^1.0.13",
+    "acorn": "^8.19.0",
+    "acorn-jsx": "^5.3.2",
+    "simple-git": "^4.0.2"
   }
 }

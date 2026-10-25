@@ -28,15 +28,25 @@ export type Occurrence = {
 
 export type Subtree = {
     hash: string;
+    /** Human-readable or mnemonic name assigned for macro invocation. */
+    name?: string;
+    /** High-level classification: statement, expression, or declaration. */
+    category?: "statement" | "expression" | "declaration";
     /** Exact serialized normalized tree, used to disambiguate hash collisions. */
     canonical: string;
     nodeType: string;
     size: number;
     depth: number;
     count: number;
+    /** Distinct repositories containing this clone. */
+    distinctRepos: number;
+    /** Distinct files containing this clone. */
+    distinctFiles: number;
+    /** Net compression utility score. */
+    score: number;
     /** Original code with binding and literal occurrences replaced by placeholders. */
     template: string;
-    /** Text replacements were nonoverlapping; does not guarantee safe macro extraction. */
+    /** Text replacements were nonoverlapping; guarantees clean textual substitution. */
     templateReady: boolean;
     parameters: Parameter[];
     locals: Local[];
@@ -44,3 +54,14 @@ export type Subtree = {
 };
 
 export type Dictionary = Record<string, Subtree>;
+
+export interface DictionaryOptions {
+    minOccurrences?: number;
+    minRepos?: number;
+    minFiles?: number;
+    minNodes?: number;
+    maxParameters?: number;
+    keepCommonLiterals?: boolean;
+    filterSubsumed?: boolean;
+    allowedNodeTypes?: Set<string>;
+}
