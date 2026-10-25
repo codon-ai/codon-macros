@@ -1,0 +1,46 @@
+/** JSON-safe output types. No AST nodes are persisted in the dictionary. */
+export type Parameter = {
+    /** Identifier used in the anonymized macro template. */
+    name: string;
+    /** Captured binding in surrounding code, or a normalized literal. */
+    kind: "capture" | "literal";
+    /** Only for literal parameters; e.g. 'number' or 'string'. */
+    literalKind?: string;
+};
+
+export type Local = {
+    /** Renamed declaration whose binding is inside the subtree. */
+    name: string;
+    /** Original spelling in the representative occurrence. */
+    example: string;
+};
+
+export type Occurrence = {
+    repository: string;
+    file: string;
+    start: number;
+    end: number;
+    /** Parameter expressions in precisely the order of Subtree.parameters. */
+    arguments: string[];
+    /** Anonymized identifier -> original spelling for this occurrence. */
+    bindings: Record<string, string>;
+};
+
+export type Subtree = {
+    hash: string;
+    /** Exact serialized normalized tree, used to disambiguate hash collisions. */
+    canonical: string;
+    nodeType: string;
+    size: number;
+    depth: number;
+    count: number;
+    /** Original code with binding and literal occurrences replaced by placeholders. */
+    template: string;
+    /** Text replacements were nonoverlapping; does not guarantee safe macro extraction. */
+    templateReady: boolean;
+    parameters: Parameter[];
+    locals: Local[];
+    occurrences: Occurrence[];
+};
+
+export type Dictionary = Record<string, Subtree>;
